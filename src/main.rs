@@ -1,21 +1,63 @@
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::Read;
-use std::mem::size_of_val;
+use std::mem::size_of;
 use std::path::Path;
 use std::slice;
 
 use ash::{Device, Entry, Instance};
 use ash::extensions::khr::Swapchain;
 use ash::vk;
-use ash::vk::{CommandBuffer, CommandPool, FramebufferCreateInfo, PhysicalDevice, Pipeline, RenderPass, SurfaceKHR, SwapchainKHR, VertexInputRate};
+use ash::vk::{BufferUsageFlags, CommandBuffer, CommandPool, DeviceSize, MemoryMapFlags, MemoryPropertyFlags, PhysicalDevice, Pipeline, SharingMode, SurfaceKHR, SwapchainKHR, VertexInputRate};
 use glam::{Vec2, Vec3};
+use lazy_static::lazy_static;
+use memoffset::offset_of;
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle, RawDisplayHandle};
 use shaderc::{CompileOptions, Compiler, ShaderKind};
-use shaderc::ShaderKind::{Fragment, Vertex};
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
+
+#[repr(C)]
+pub struct Vertex {
+    position: Vec2,
+    color: Vec3
+}
+
+impl Vertex {
+
+    pub fn new(position: Vec2, color: Vec3) -> Self {
+        Self { position, color }
+    }
+
+    pub fn binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::default()
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(VertexInputRate::VERTEX)
+    }
+
+    pub fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        [
+            vk::VertexInputAttributeDescription::default()
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Vertex, position) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(offset_of!(Vertex, color) as u32)
+        ]
+    }
+
+}
+
+lazy_static! {
+    pub static ref VERTICES: Vec<Vertex> = vec![
+        Vertex::new(Vec2::new(-0.5, -0.5), Vec3::new(1.0, 0.0, 1.0)),
+        Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(1.0, 1.0, 0.0)),
+        Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(0.0, 1.0, 1.0))
+    ];
+}
 
 #[inline]
 pub fn create_shader_module(device: &Device, path: impl AsRef<Path>, kind: ShaderKind) -> vk::ShaderModule {
@@ -25,7 +67,7 @@ pub fn create_shader_module(device: &Device, path: impl AsRef<Path>, kind: Shade
     file.read_to_string(&mut string).unwrap();
 
     let compiler = Compiler::new().unwrap();
-    let mut options = CompileOptions::new().unwrap();
+    let options = CompileOptions::new().unwrap();
     let binary_result = compiler.compile_into_spirv(&string, kind, "shader.glsl", "main",
                                                     Some(&options)).unwrap();
 
@@ -81,7 +123,7 @@ pub fn create_swapchain(instance: &Instance, device: &Device, surface: SurfaceKH
             .image_extent(vk::Extent2D { width: window.inner_size().width, height: window.inner_size().height })
             .image_array_layers(1)
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-            .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .image_sharing_mode(SharingMode::EXCLUSIVE)
             .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
             .present_mode(vk::PresentModeKHR::FIFO);
@@ -104,11 +146,21 @@ pub fn create_command_buffer(device: &Device) -> (CommandBuffer, CommandPool) {
     }
 }
 
+pub unsafe fn get_memory_type_index(instance: &Instance, physical_device: PhysicalDevice, type_filter: u32, properties: vk::MemoryPropertyFlags) -> u32 {
+    let memory_properties = instance.get_physical_device_memory_properties(physical_device);
+    for i in 0..memory_properties.memory_type_count as usize {
+        if (type_filter & (1 << i)) != 1 && !(memory_properties.memory_types[i].property_flags & properties).is_empty() {
+            return i as u32;
+        }
+    }
+    panic!("No support ig... ._.")
+}
+
 pub fn create_pipeline(device: &Device, window: &Window, vertex_shader: &str, fragment_shader: &str) -> Pipeline {
     unsafe {
         // Load Shader
-        let vertex_shader = create_shader_module(device, vertex_shader, Vertex);
-        let fragment_shader = create_shader_module(device, fragment_shader, Fragment);
+        let vertex_shader = create_shader_module(device, vertex_shader, ShaderKind::Vertex);
+        let fragment_shader = create_shader_module(device, fragment_shader, ShaderKind::Fragment);
 
         // Create Pipeline
         let pipeline_vertex_shader_stage_create_info = vk::PipelineShaderStageCreateInfo::default()
@@ -121,7 +173,13 @@ pub fn create_pipeline(device: &Device, window: &Window, vertex_shader: &str, fr
             .module(fragment_shader)
             .name(CStr::from_ptr(b"main\0".as_ptr().cast()));
 
-        let pipeline_vertex_input_state_create_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let binding_description = Vertex::binding_description();
+        let attribute_descriptions = Vertex::attribute_descriptions();
+        let pipeline_vertex_input_state_create_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(slice::from_ref(&binding_description))
+            .vertex_attribute_descriptions(attribute_descriptions.as_slice());
+
+
         let pipeline_input_assembly_state_create_info = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .primitive_restart_enable(false);
@@ -173,7 +231,7 @@ pub fn create_pipeline(device: &Device, window: &Window, vertex_shader: &str, fr
             .multisample_state(&pipeline_multisample_state_create_info)
             .color_blend_state(&pipeline_color_blend_state_create_info)
             .dynamic_state(&dynamic_state_create_info)
-            .base_pipeline_handle(vk::Pipeline::null())
+            .base_pipeline_handle(Pipeline::null())
             .layout(pipeline_layout);
         device.create_graphics_pipelines(vk::PipelineCache::null(), slice::from_ref(&graphics_pipeline_create_info),
                                          None).unwrap()[0]
@@ -193,6 +251,7 @@ fn main() {
         let device = get_device(&instance, best_physical_device);
         let queue = device.get_device_queue(0, 0);
 
+        // Surface and Swapchain
         let surface = ash_window::create_surface(&entry, &instance, window.raw_display_handle(),
                                                  window.raw_window_handle(), None).unwrap();
         let (swapchain, swapchain_loader) = create_swapchain(&instance, &device, surface, &window);
@@ -216,6 +275,27 @@ fn main() {
         let present_semaphore = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
         let pipeline = create_pipeline(&device, &window, "shader.vert.glsl", "shader.frag.glsl");
 
+        // Vertex Buffer lol
+        let buffer_create_info = vk::BufferCreateInfo::default()
+            .usage(BufferUsageFlags::VERTEX_BUFFER)
+            .size(DeviceSize::from((size_of::<Vertex>() * VERTICES.len()) as u32))
+            .sharing_mode(SharingMode::EXCLUSIVE);
+
+        let vertex_buffer = device.create_buffer(&buffer_create_info, None).unwrap();
+
+        let memory_requirements = device.get_buffer_memory_requirements(vertex_buffer);
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_requirements.size)
+            .memory_type_index(get_memory_type_index(&instance, best_physical_device, memory_requirements.memory_type_bits,
+                                                     MemoryPropertyFlags::HOST_VISIBLE | MemoryPropertyFlags::HOST_COHERENT));
+        let allocated_memory = device.allocate_memory(&allocate_info, None).unwrap();
+        device.bind_buffer_memory(vertex_buffer, allocated_memory, DeviceSize::from(0 as u64)).unwrap();
+
+        let pointer = device.map_memory(allocated_memory, DeviceSize::from(0 as u64), buffer_create_info.size, MemoryMapFlags::empty()).unwrap();
+        std::ptr::copy_nonoverlapping(VERTICES.as_ptr(), pointer.cast(), VERTICES.len());
+        device.unmap_memory(allocated_memory);
+
+
         // Run Window
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -224,6 +304,8 @@ fn main() {
                     event: WindowEvent::CloseRequested,
                     window_id
                 } if window_id == window.id() => {
+                    device.free_memory(allocated_memory, None);
+                    device.destroy_buffer(vertex_buffer, None);
                     device.free_command_buffers(command_pool, slice::from_ref(&command_buffer));
                     device.destroy_command_pool(command_pool, None);
                     *control_flow = ControlFlow::Exit
@@ -273,6 +355,7 @@ fn main() {
                     device.cmd_begin_rendering(command_buffer, &rendering_info);
 
                     device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                    device.cmd_bind_vertex_buffers(command_buffer, 0, slice::from_ref(&vertex_buffer), slice::from_ref(&DeviceSize::from(0 as u32)));
                     device.cmd_draw(command_buffer, 3, 1, 0, 0);
 
                     device.cmd_end_rendering(command_buffer);
